@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "ASiC-E container format (ETSI EN 319 162-1) with the BDOC profile"
 license = "Apache-2.0"
+homepage = "https://github.com/takakv/asice-rs"
+repository = "https://github.com/takakv/asice-rs"
+keywords = ["asice", "eidas", "bdoc", "digidoc"]
 
 [dependencies]
 thiserror = "2.0.18"
