@@ -1,6 +1,6 @@
 [package]
 name = "asice"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "ASiC-E container format (ETSI EN 319 162-1) with the BDOC profile"
 license = "Apache-2.0"

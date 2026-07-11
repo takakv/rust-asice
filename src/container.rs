@@ -1,22 +1,48 @@
+//! In-memory representation of an ASiC-E container.
+
 use std::io::{Cursor, Read, Seek, Write};
 
-use crate::{manifest, LibError, Result, MIMETYPE};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-/// A payload file stored in the container.
+use crate::{manifest, LibError, Result, MIMETYPE};
+
+/// A data file stored in the container.
 #[derive(Debug, Clone)]
 pub struct DataFile {
+    /// File name inside the archive.
     pub name: String,
+    /// Media type recorded in the manifest.
     pub mime_type: String,
+    /// Raw file content.
     pub content: Vec<u8>,
 }
 
-/// A signature document (`META-INF/*signatures*.xml`), carried as opaque XML.
+/// A signature document (`META-INF/*signatures*.xml`).
 #[derive(Debug, Clone)]
 pub struct SignatureFile {
+    /// Document name inside the archive.
     pub name: String,
+    /// The signature document as opaque XML.
     pub xml: String,
+}
+
+/// Policy for `Container::open_with`.
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    /// Require the `mimetype` entry to be present.
+    ///
+    /// Optional in EN 319 162-1 but additional profiles (e.g. BDOC) may require it.
+    /// Defaults to `false`.
+    pub require_mimetype: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            require_mimetype: false,
+        }
+    }
 }
 
 /// An ASiC-E container held in memory.
@@ -24,6 +50,8 @@ pub struct SignatureFile {
 pub struct Container {
     data_files: Vec<DataFile>,
     signatures: Vec<SignatureFile>,
+    /// Potential structural anomalies found while opening a container.
+    warnings: Vec<String>,
 }
 
 impl Container {
@@ -43,6 +71,9 @@ impl Container {
     }
 
     /// Add a data file.
+    ///
+    /// # Errors
+    /// If the name is not relative, a duplicate, or reserved.
     pub fn add_file(
         &mut self,
         name: impl Into<String>,
@@ -63,6 +94,9 @@ impl Container {
     }
 
     /// Append a signature document.
+    ///
+    /// The entry name is assigned automatically as `META-INF/signaturesN.xml`,
+    /// using the first free index `N`.
     pub fn add_signature_xml(&mut self, xml: String) -> &SignatureFile {
         let mut n = self.signatures.len();
         let name = loop {
@@ -76,7 +110,13 @@ impl Container {
         self.signatures.last().expect("a signature should exist")
     }
 
-    fn open<R: Read + Seek>(reader: R) -> Result<Self> {
+    /// Open a container from any seekable reader, using default `OpenOptions`.
+    pub fn open<R: Read + Seek>(reader: R) -> Result<Self> {
+        Self::open_with(reader, &OpenOptions::default())
+    }
+
+    /// Open a container from any seekable reader under an explicit policy.
+    pub fn open_with<R: Read + Seek>(reader: R, opts: &OpenOptions) -> Result<Self> {
         let mut zip = ZipArchive::new(reader)?;
         let mut container = Container::default();
 
@@ -84,35 +124,39 @@ impl Container {
         for i in 0..zip.len() {
             names.push(zip.by_index(i)?.name().to_owned());
         }
+
         // EN 319 162-1 v1.1.1, A.1. If present, the mimetype shall
         // - be the first file in the ASiC container
         // - not be compressed
         // BDOC mandates the presence of the mimetype file.
-        // TODO: parametrise the requirement for wider ASiC-E compatibility.
-        match names.first() {
-            Some(n) if n == "mimetype" => {
+        let mimetype_present = names.iter().any(|n| n == "mimetype");
+        if let Some(n) = names.first() {
+            if n == "mimetype" {
                 let entry = zip.by_index(0)?;
                 if entry.compression() != CompressionMethod::Stored {
-                    return Err(LibError::Container("'mimetype' is compressed".into()));
+                    container.warnings.push("'mimetype' is compressed".into());
                 }
-            }
-            _ => {
-                return if names.iter().any(|n| n == "mimetype") {
-                    Err(LibError::Container(
-                        "'mimetype' is not the first zip entry".into(),
-                    ))
-                } else {
-                    Err(LibError::Container("missing mimetype entry".into()))
-                };
+            } else if mimetype_present {
+                container
+                    .warnings
+                    .push("'mimetype' is not the first zip entry".into());
             }
         }
-        let mimetype = read_entry(&mut zip, "mimetype")?;
-        let mimetype = String::from_utf8_lossy(&mimetype);
-        if mimetype.trim() != MIMETYPE {
-            return Err(LibError::Container(format!(
-                "unexpected container mime type: {}",
-                mimetype.trim()
-            )));
+        if mimetype_present {
+            let mimetype = read_entry(&mut zip, "mimetype")?;
+            let mimetype = String::from_utf8_lossy(&mimetype);
+            if mimetype.trim() != MIMETYPE {
+                return Err(LibError::Container(format!(
+                    "unexpected container mime type: {}",
+                    mimetype.trim()
+                )));
+            }
+        } else if opts.require_mimetype {
+            return Err(LibError::Container("missing mimetype entry".into()));
+        } else {
+            container
+                .warnings
+                .push("container has no mimetype entry".into());
         }
 
         // BDOC requires the presence of the 'manifest.xml'.
@@ -175,6 +219,11 @@ impl Container {
     /// Open a container file from disk.
     pub fn open_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::open(std::fs::File::open(path)?)
+    }
+
+    /// Open a container file from disk under an explicit policy.
+    pub fn open_file_with(path: impl AsRef<std::path::Path>, opts: &OpenOptions) -> Result<Self> {
+        Self::open_with(std::fs::File::open(path)?, opts)
     }
 
     fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {

@@ -1,6 +1,9 @@
+//! META-INF/manifest.xml parse and build.
+
 use crate::container::DataFile;
 use crate::{LibError, Result, MANIFEST_NS, MIMETYPE};
 
+/// Parse a manifest into (full-path, media-type) pairs.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<(String, String)>> {
     let doc = uppsala::parse_bytes(bytes).map_err(|e| LibError::Xml(format!("manifest: {e}")))?;
     let mut entries = Vec::new();
@@ -22,6 +25,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<(String, String)>> {
     Ok(entries)
 }
 
+/// Serialize a manifest for the given data files.
 pub(crate) fn build(files: &[DataFile]) -> Vec<u8> {
     let mut w = uppsala::XmlWriter::new();
     w.write_declaration();
