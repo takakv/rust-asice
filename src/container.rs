@@ -164,9 +164,8 @@ impl Container {
                 .push("container has no mimetype entry".into());
         }
 
-        // BDOC requires the presence of the 'manifest.xml'.
-        // See '4.4.3.2 5) b)' of EN 319 162-1 v1.1.1 for manifest.xml specifics.
-        // TODO: parametrise the requirement for wider ASiC-E compatibility.
+        // EN 319 162-1 V1.1.1 § 5.3.3 (Table 5)
+        // 'META-INF/manifest.xml shall be present' for ASiC-E with XAdES signatures
         let manifest_types = match read_entry(&mut zip, "META-INF/manifest.xml") {
             Ok(bytes) => manifest::parse(&bytes)?,
             Err(_) => {
