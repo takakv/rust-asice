@@ -5,7 +5,7 @@ use std::io::{Cursor, Read, Seek, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::{manifest, LibError, Result, MIMETYPE};
+use crate::{LibError, MIMETYPE, Result, manifest};
 
 /// A data file stored in the container.
 #[derive(Debug, Clone)]
@@ -21,10 +21,19 @@ pub struct DataFile {
 /// A signature document (`META-INF/*signatures*.xml`).
 #[derive(Debug, Clone)]
 pub struct SignatureFile {
-    /// Document name inside the archive.
+    /// Entry name inside the archive, e.g. `META-INF/signatures0.xml`.
     pub name: String,
     /// The signature document as opaque XML.
     pub xml: String,
+}
+
+/// An uninterpreted `META-INF/` entry.
+#[derive(Debug, Clone)]
+pub struct MetaInfFile {
+    /// Entry name inside the archive, e.g. `META-INF/metadata.xml`.
+    pub name: String,
+    /// Raw file content.
+    pub content: Vec<u8>,
 }
 
 /// Policy for `Container::open_with`.
@@ -53,7 +62,7 @@ pub struct Container {
     /// Potential structural anomalies found while opening a container.
     warnings: Vec<String>,
     /// Uninterpreted `META-INF/` entries.
-    other_meta_inf: Vec<(String, Vec<u8>)>,
+    meta_inf_files: Vec<MetaInfFile>,
     original_manifest: Option<Vec<u8>>,
 }
 
@@ -71,6 +80,11 @@ impl Container {
     /// Signature documents in the container.
     pub fn signatures(&self) -> &[SignatureFile] {
         &self.signatures
+    }
+
+    /// Uninterpreted `META-INF/` entries.
+    pub fn meta_inf_files(&self) -> &[MetaInfFile] {
+        &self.meta_inf_files
     }
 
     /// Structural warnings collected when opening the container.
@@ -188,12 +202,15 @@ impl Container {
                             .map_err(|_| LibError::Xml(format!("{name} is not valid UTF-8")))?,
                     });
                 } else if rest != "manifest.xml" {
-                    // '4.4.3.2 Note 5' of EN 319 162-1 v1.1.1:
-                    // Other file objects in META-INF/ need not be parsed and interpreted for the
-                    // purpose of the ASiC container validation, provided that they do not contain
-                    // the string "signature" or "timestamp" or "manifest" or "container.xml".
-                    // TODO: implement this check, and the processing of the other allowed files.
-                    container.other_meta_inf.push((name.clone(), bytes));
+                    if has_reserved_meta_inf_name(rest) {
+                        container
+                            .warnings
+                            .push(format!("{name}: reserved word in META-INF file name"));
+                    }
+                    container.meta_inf_files.push(MetaInfFile {
+                        name: name.clone(),
+                        content: bytes,
+                    });
                 }
                 continue;
             }
@@ -267,9 +284,9 @@ impl Container {
             zip.write_all(sig.xml.as_bytes())?;
         }
 
-        for (name, bytes) in &self.other_meta_inf {
-            zip.start_file(name, deflated)?;
-            zip.write_all(bytes)?;
+        for file in &self.meta_inf_files {
+            zip.start_file(&file.name, deflated)?;
+            zip.write_all(&file.content)?;
         }
 
         zip.finish()?;
@@ -316,4 +333,17 @@ fn validate_entry_name(name: &str) -> Result<()> {
 fn is_signature_entry(meta_inf_rest: &str) -> bool {
     // See '4.4.3.2 2)' of EN 319 162-1 v1.1.1
     meta_inf_rest.contains("signatures") && meta_inf_rest.ends_with(".xml")
+}
+
+fn has_reserved_meta_inf_name(meta_inf_rest: &str) -> bool {
+    // See '4.4.3.2 5) d) i)' of EN 319 162-1 v1.1.1
+    let defined = meta_inf_rest == "container.xml"
+        || meta_inf_rest == "metadata.xml"
+        || (meta_inf_rest.starts_with("ASiCEvidenceRecordManifest")
+            && meta_inf_rest.ends_with(".xml"));
+    let lower = meta_inf_rest.to_ascii_lowercase();
+    !defined
+        && ["signature", "timestamp", "manifest", "container.xml"]
+            .iter()
+            .any(|word| lower.contains(word))
 }

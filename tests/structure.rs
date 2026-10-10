@@ -59,3 +59,50 @@ fn round_trip_keeps_meta_inf_entries_and_manifest() {
     assert!(manifest.contains(r#"manifest:full-path="new.txt""#));
     assert!(manifest.contains(r#"manifest:full-path="test.txt""#));
 }
+
+#[test]
+fn warns_on_reserved_meta_inf_names() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, content) in [
+        ("mimetype", asic_e::MIMETYPE.as_bytes()),
+        ("test.txt", b"lorem ipsum".as_slice()),
+        ("META-INF/manifest.xml", EXTRAS_MANIFEST.as_bytes()),
+        (
+            "META-INF/signatures0.xml",
+            b"<asic:XAdESSignatures/>".as_slice(),
+        ),
+        // Allowed by EN 319 162-1, 4.4.3.2.
+        ("META-INF/container.xml", b"<container/>".as_slice()),
+        ("META-INF/metadata.xml", b"<metadata/>".as_slice()),
+        (
+            "META-INF/ASiCEvidenceRecordManifest1.xml",
+            b"<ASiCManifest/>".as_slice(),
+        ),
+        // Contain a reserved word.
+        ("META-INF/timestamp.tst", b"tst".as_slice()),
+        (
+            "META-INF/Signatures1.xml",
+            b"<asic:XAdESSignatures/>".as_slice(),
+        ),
+    ] {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(content).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+
+    let container = Container::from_bytes(&bytes).unwrap();
+    assert_eq!(container.meta_inf_files().len(), 5);
+    let warned: Vec<_> = container
+        .warnings()
+        .iter()
+        .filter_map(|w| w.split(':').next())
+        .collect();
+    assert_eq!(
+        warned,
+        ["META-INF/timestamp.tst", "META-INF/Signatures1.xml"]
+    );
+}

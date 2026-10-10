@@ -5,7 +5,7 @@ use thiserror::Error;
 mod container;
 mod manifest;
 
-pub use container::{Container, DataFile, OpenOptions, SignatureFile};
+pub use container::{Container, DataFile, MetaInfFile, OpenOptions, SignatureFile};
 
 /// ASiC-E container media type.
 pub const MIMETYPE: &str = "application/vnd.etsi.asic-e+zip";
