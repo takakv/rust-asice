@@ -1,5 +1,6 @@
 //! In-memory representation of an ASiC-E container.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, Write};
 
 use zip::write::SimpleFileOptions;
@@ -188,8 +189,46 @@ impl Container {
         // 'META-INF/manifest.xml shall be present' for ASiC-E with XAdES signatures
         let manifest_bytes = read_entry(&mut zip, "META-INF/manifest.xml")
             .map_err(|_| LibError::Container("container has no META-INF/manifest.xml".into()))?;
-        let manifest_types = manifest::parse(&manifest_bytes)?;
+        let manifest_entries = manifest::parse(&manifest_bytes)?;
         container.original_manifest = Some(manifest_bytes);
+
+        let mut manifest_types: HashMap<String, String> = HashMap::new();
+        for (path, media_type) in manifest_entries {
+            // ODF 1.2 Part 3, 3.2: the manifest and the mimetype are not listed.
+            if path == "META-INF/manifest.xml" || path == "mimetype" {
+                container
+                    .warnings
+                    .push(format!("manifest must not list '{path}'"));
+            }
+            // ODF 1.2 Part 3, 4.8.4: only files and folders within the zip are listed.
+            if !path.ends_with('/') && !names.contains(&path) {
+                container.warnings.push(format!(
+                    "manifest lists '{path}', which is not in the container"
+                ));
+            }
+            // ODF 1.2 Part 3, 3.2: each file is listed only once.
+            if manifest_types.contains_key(&path) {
+                return Err(LibError::Container(format!(
+                    "manifest lists '{path}' more than once"
+                )));
+            }
+            manifest_types.insert(path, media_type);
+        }
+
+        // ODF 1.2 Part 3, 3.2 and 3.3: "/" is listed if and only if there is a mimetype,
+        // and its media type matches the mimetype's content.
+        match (manifest_types.get("/"), mimetype_present) {
+            (None, true) => container
+                .warnings
+                .push("manifest has no '/' entry, although the container has a mimetype".into()),
+            (Some(_), false) => container
+                .warnings
+                .push("manifest has a '/' entry, although the container has no mimetype".into()),
+            (Some(media_type), true) if media_type != MIMETYPE => container.warnings.push(format!(
+                "manifest gives '/' the media type '{media_type}', which differs from the mimetype"
+            )),
+            _ => {}
+        }
 
         for name in &names {
             if name == "mimetype" || name.ends_with('/') {
@@ -216,13 +255,9 @@ impl Container {
                 }
                 continue;
             }
-            let mime_type = manifest_types
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, m)| m.clone())
-                .ok_or_else(|| {
-                    LibError::Container(format!("missing MIME type in manifest for {name}"))
-                })?;
+            let mime_type = manifest_types.remove(name).ok_or_else(|| {
+                LibError::Container(format!("missing MIME type in manifest for {name}"))
+            })?;
             container.data_files.push(DataFile {
                 name: name.clone(),
                 mime_type,

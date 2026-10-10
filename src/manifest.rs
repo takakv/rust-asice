@@ -16,9 +16,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<(String, String)>> {
         }
         let full_path = el.get_attribute_ns(MANIFEST_NS, "full-path");
         let media_type = el.get_attribute_ns(MANIFEST_NS, "media-type");
-        if let (Some(p), Some(m)) = (full_path, media_type)
-            && p != "/"
-        {
+        if let (Some(p), Some(m)) = (full_path, media_type) {
             entries.push((p.to_owned(), m.to_owned()));
         }
     }

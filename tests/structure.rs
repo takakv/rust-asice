@@ -106,3 +106,94 @@ fn warns_on_reserved_meta_inf_names() {
         ["META-INF/timestamp.tst", "META-INF/Signatures1.xml"]
     );
 }
+
+fn uncompressed_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, content) in files {
+        zip.start_file(*name, stored).unwrap();
+        zip.write_all(content).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+const MANIFEST_NS: &str = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0";
+
+fn container_with_manifest(mimetype: bool, entries: &[(&str, &str)]) -> asic_e::Result<Container> {
+    let entries: String = entries
+        .iter()
+        .map(|(path, media_type)| {
+            format!(r#"<manifest:file-entry manifest:full-path="{path}" manifest:media-type="{media_type}"/>"#)
+        })
+        .collect();
+    let manifest = format!(
+        r#"<manifest:manifest xmlns:manifest="{MANIFEST_NS}" manifest:version="1.2">{entries}</manifest:manifest>"#
+    );
+
+    let mut files = vec![
+        ("test.txt", b"lorem ipsum".as_slice()),
+        ("META-INF/manifest.xml", manifest.as_bytes()),
+    ];
+    if mimetype {
+        files.insert(0, ("mimetype", asic_e::MIMETYPE.as_bytes()));
+    }
+    Container::from_bytes(&uncompressed_zip(&files))
+}
+
+#[test]
+fn checks_manifest_against_odf_rules() {
+    let warnings = |mimetype: bool, entries: &[(&str, &str)]| {
+        container_with_manifest(mimetype, entries)
+            .unwrap()
+            .warnings()
+            .to_vec()
+    };
+    let root = ("/", asic_e::MIMETYPE);
+    let txt = ("test.txt", "text/plain");
+
+    assert!(warnings(true, &[root, txt]).is_empty());
+    assert_eq!(
+        warnings(
+            true,
+            &[
+                root,
+                txt,
+                ("mimetype", "text/plain"),
+                ("META-INF/manifest.xml", "text/xml")
+            ]
+        ),
+        [
+            "manifest must not list 'mimetype'",
+            "manifest must not list 'META-INF/manifest.xml'"
+        ]
+    );
+    assert_eq!(
+        warnings(true, &[root, txt, ("missing.txt", "text/plain")]),
+        ["manifest lists 'missing.txt', which is not in the container"]
+    );
+    assert_eq!(
+        warnings(true, &[txt]),
+        ["manifest has no '/' entry, although the container has a mimetype"]
+    );
+    assert_eq!(
+        warnings(false, &[root, txt]),
+        [
+            "container has no mimetype entry",
+            "manifest has a '/' entry, although the container has no mimetype"
+        ]
+    );
+    assert_eq!(
+        warnings(true, &[("/", "application/zip"), txt]),
+        ["manifest gives '/' the media type 'application/zip', which differs from the mimetype"]
+    );
+
+    let err = container_with_manifest(true, &[root, txt, txt]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("manifest lists 'test.txt' more than once"),
+        "{err}"
+    );
+}
