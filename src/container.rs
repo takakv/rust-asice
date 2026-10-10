@@ -140,13 +140,15 @@ impl Container {
 
     /// Open a container from any seekable reader under an explicit policy.
     pub fn open_with<R: Read + Seek>(reader: R, opts: &OpenOptions) -> Result<Self> {
+        // TODO: check for duplicate entry names once https://github.com/zip-rs/zip2/issues/841
+        // is addressed.
         let mut zip = ZipArchive::new(reader)?;
         let mut container = Container::default();
 
-        let mut names: Vec<String> = Vec::with_capacity(zip.len());
-        for i in 0..zip.len() {
-            names.push(zip.by_index(i)?.name().to_owned());
-        }
+        let names = zip
+            .file_names()
+            .map(|name| Ok(name?.into()))
+            .collect::<Result<Vec<String>>>()?;
 
         // EN 319 162-1 v1.1.1, A.1. If present, the mimetype shall
         // - be the first file in the ASiC container
