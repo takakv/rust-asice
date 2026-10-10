@@ -52,6 +52,9 @@ pub struct Container {
     signatures: Vec<SignatureFile>,
     /// Potential structural anomalies found while opening a container.
     warnings: Vec<String>,
+    /// Uninterpreted `META-INF/` entries.
+    other_meta_inf: Vec<(String, Vec<u8>)>,
+    original_manifest: Option<Vec<u8>>,
 }
 
 impl Container {
@@ -95,6 +98,7 @@ impl Container {
             mime_type: mime_type.into(),
             content,
         });
+        self.original_manifest = None;
         Ok(())
     }
 
@@ -166,14 +170,10 @@ impl Container {
 
         // EN 319 162-1 V1.1.1 § 5.3.3 (Table 5)
         // 'META-INF/manifest.xml shall be present' for ASiC-E with XAdES signatures
-        let manifest_types = match read_entry(&mut zip, "META-INF/manifest.xml") {
-            Ok(bytes) => manifest::parse(&bytes)?,
-            Err(_) => {
-                return Err(LibError::Container(
-                    "container has no META-INF/manifest.xml".into(),
-                ));
-            }
-        };
+        let manifest_bytes = read_entry(&mut zip, "META-INF/manifest.xml")
+            .map_err(|_| LibError::Container("container has no META-INF/manifest.xml".into()))?;
+        let manifest_types = manifest::parse(&manifest_bytes)?;
+        container.original_manifest = Some(manifest_bytes);
 
         for name in &names {
             if name == "mimetype" || name.ends_with('/') {
@@ -187,12 +187,14 @@ impl Container {
                         xml: String::from_utf8(bytes)
                             .map_err(|_| LibError::Xml(format!("{name} is not valid UTF-8")))?,
                     });
+                } else if rest != "manifest.xml" {
+                    // '4.4.3.2 Note 5' of EN 319 162-1 v1.1.1:
+                    // Other file objects in META-INF/ need not be parsed and interpreted for the
+                    // purpose of the ASiC container validation, provided that they do not contain
+                    // the string "signature" or "timestamp" or "manifest" or "container.xml".
+                    // TODO: implement this check, and the processing of the other allowed files.
+                    container.other_meta_inf.push((name.clone(), bytes));
                 }
-                // '4.4.3.2 Note 5' of EN 319 162-1 v1.1.1:
-                // Other file objects in META-INF/ need not be parsed and interpreted for the
-                // purpose of the ASiC container validation, provided that they do not contain the
-                // string "signature" or "timestamp" or "manifest" or "container.xml".
-                // TODO: implement this check, and the processing of the other allowed files.
                 continue;
             }
             let mime_type = manifest_types
@@ -253,12 +255,21 @@ impl Container {
             zip.write_all(&file.content)?;
         }
 
+        // A signature may cover the manifest (EN 319 162-1 v1.1.1, 4.4.3.2 Note 4).
         zip.start_file("META-INF/manifest.xml", deflated)?;
-        zip.write_all(&manifest::build(&self.data_files))?;
+        match &self.original_manifest {
+            Some(bytes) => zip.write_all(bytes)?,
+            None => zip.write_all(&manifest::build(&self.data_files))?,
+        }
 
         for sig in &self.signatures {
             zip.start_file(&sig.name, deflated)?;
             zip.write_all(sig.xml.as_bytes())?;
+        }
+
+        for (name, bytes) in &self.other_meta_inf {
+            zip.start_file(name, deflated)?;
+            zip.write_all(bytes)?;
         }
 
         zip.finish()?;
