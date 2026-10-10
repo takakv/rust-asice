@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, Write};
 
+use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -45,12 +46,21 @@ pub struct OpenOptions {
     /// Optional in EN 319 162-1 but additional profiles (e.g. BDOC) may require it.
     /// Defaults to `false`.
     pub require_mimetype: bool,
+    /// Maximum total uncompressed size of the container's entries, in bytes.
+    /// Defaults to [`OpenOptions::DEFAULT_MAX_TOTAL_SIZE`].
+    pub max_total_size: u64,
+}
+
+impl OpenOptions {
+    /// Default for [`OpenOptions::max_total_size`]: 512 MiB.
+    pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 512 * 1024 * 1024;
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             require_mimetype: false,
+            max_total_size: Self::DEFAULT_MAX_TOTAL_SIZE,
         }
     }
 }
@@ -145,6 +155,7 @@ impl Container {
         // is addressed.
         let mut zip = ZipArchive::new(reader)?;
         let mut container = Container::default();
+        let mut total_size = 0;
 
         let names = zip
             .file_names()
@@ -169,7 +180,7 @@ impl Container {
             }
         }
         if mimetype_present {
-            let mimetype = read_entry(&mut zip, "mimetype")?;
+            let mimetype = read_entry(&mut zip, "mimetype", opts, &mut total_size)?;
             let mimetype = String::from_utf8_lossy(&mimetype);
             if mimetype.trim() != MIMETYPE {
                 return Err(LibError::Container(format!(
@@ -187,8 +198,12 @@ impl Container {
 
         // EN 319 162-1 V1.1.1 § 5.3.3 (Table 5)
         // 'META-INF/manifest.xml shall be present' for ASiC-E with XAdES signatures
-        let manifest_bytes = read_entry(&mut zip, "META-INF/manifest.xml")
-            .map_err(|_| LibError::Container("container has no META-INF/manifest.xml".into()))?;
+        if !names.iter().any(|n| n == "META-INF/manifest.xml") {
+            return Err(LibError::Container(
+                "container has no META-INF/manifest.xml".into(),
+            ));
+        }
+        let manifest_bytes = read_entry(&mut zip, "META-INF/manifest.xml", opts, &mut total_size)?;
         let manifest_entries = manifest::parse(&manifest_bytes)?;
         container.original_manifest = Some(manifest_bytes);
 
@@ -231,10 +246,10 @@ impl Container {
         }
 
         for name in &names {
-            if name == "mimetype" || name.ends_with('/') {
+            if name == "mimetype" || name == "META-INF/manifest.xml" || name.ends_with('/') {
                 continue;
             }
-            let bytes = read_entry(&mut zip, name)?;
+            let bytes = read_entry(&mut zip, name, opts, &mut total_size)?;
             if let Some(rest) = name.strip_prefix("META-INF/") {
                 if is_signature_entry(rest) {
                     container.signatures.push(SignatureFile {
@@ -242,7 +257,7 @@ impl Container {
                         xml: String::from_utf8(bytes)
                             .map_err(|_| LibError::Xml(format!("{name} is not valid UTF-8")))?,
                     });
-                } else if rest != "manifest.xml" {
+                } else {
                     if has_reserved_meta_inf_name(rest) {
                         container
                             .warnings
@@ -343,11 +358,28 @@ impl Container {
     }
 }
 
-fn read_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
-    let mut entry = zip
-        .by_name(name)
-        .map_err(|_| LibError::Container(format!("missing zip entry: {name}")))?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
+fn read_entry<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    name: &str,
+    opts: &OpenOptions,
+    total_size: &mut u64,
+) -> Result<Vec<u8>> {
+    let mut entry = match zip.by_name(name) {
+        Ok(entry) => entry,
+        Err(ZipError::FileNotFound) => {
+            return Err(LibError::Container(format!("missing zip entry: {name}")));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    *total_size = total_size.saturating_add(entry.size());
+    if *total_size > opts.max_total_size {
+        return Err(LibError::Container(format!(
+            "container entries declare more than the {} byte limit in total",
+            opts.max_total_size
+        )));
+    }
+    // `zip` fails the read if the entry decompresses to more than its declared size.
+    let mut buf = Vec::new();
     entry.read_to_end(&mut buf)?;
     Ok(buf)
 }

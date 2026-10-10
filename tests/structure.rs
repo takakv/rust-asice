@@ -197,3 +197,26 @@ fn checks_manifest_against_odf_rules() {
         "{err}"
     );
 }
+
+fn minimal_container() -> Vec<u8> {
+    uncompressed_zip(&[
+        ("mimetype", asic_e::MIMETYPE.as_bytes()),
+        ("test.txt", b"lorem ipsum".as_slice()),
+        ("META-INF/manifest.xml", EXTRAS_MANIFEST.as_bytes()),
+    ])
+}
+
+#[test]
+fn enforces_size_limit() {
+    let bytes = minimal_container();
+    let total = (asic_e::MIMETYPE.len() + "lorem ipsum".len() + EXTRAS_MANIFEST.len()) as u64;
+    let opts = |max_total_size| asic_e::OpenOptions {
+        max_total_size,
+        ..Default::default()
+    };
+    assert!(Container::from_bytes_with(&bytes, &opts(total)).is_ok());
+
+    let err = Container::from_bytes_with(&bytes, &opts(total - 1)).unwrap_err();
+    let expected = format!("more than the {} byte limit", total - 1);
+    assert!(err.to_string().contains(&expected), "{err}");
+}
