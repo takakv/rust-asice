@@ -1,7 +1,7 @@
 //! In-memory representation of an ASiC-E container.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, Write};
+use std::io::{Cursor, ErrorKind, Read, Seek, Write};
 
 use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
@@ -150,7 +150,9 @@ impl Container {
     }
 
     /// Open a container from any seekable reader under an explicit policy.
-    pub fn open_with<R: Read + Seek>(reader: R, opts: &OpenOptions) -> Result<Self> {
+    pub fn open_with<R: Read + Seek>(mut reader: R, opts: &OpenOptions) -> Result<Self> {
+        let first_header = read_first_header(&mut reader)?;
+
         // TODO: check for duplicate entry names once https://github.com/zip-rs/zip2/issues/841
         // is addressed.
         let mut zip = ZipArchive::new(reader)?;
@@ -162,31 +164,24 @@ impl Container {
             .map(|name| Ok(name?.into()))
             .collect::<Result<Vec<String>>>()?;
 
-        // EN 319 162-1 v1.1.1, A.1. If present, the mimetype shall
-        // - be the first file in the ASiC container
-        // - not be compressed
         // BDOC mandates the presence of the mimetype file.
         let mimetype_present = names.iter().any(|n| n == "mimetype");
-        if let Some(n) = names.first() {
-            if n == "mimetype" {
-                let entry = zip.by_index(0)?;
-                if entry.compression() != CompressionMethod::Stored {
-                    container.warnings.push("'mimetype' is compressed".into());
-                }
-            } else if mimetype_present {
-                container
-                    .warnings
-                    .push("'mimetype' is not the first zip entry".into());
-            }
-        }
         if mimetype_present {
             let mimetype = read_entry(&mut zip, "mimetype", opts, &mut total_size)?;
+            container
+                .warnings
+                .extend(check_mimetype_header(first_header));
             let mimetype = String::from_utf8_lossy(&mimetype);
             if mimetype.trim() != MIMETYPE {
                 return Err(LibError::Container(format!(
                     "unexpected container mime type: {}",
                     mimetype.trim()
                 )));
+            }
+            if mimetype != MIMETYPE {
+                container
+                    .warnings
+                    .push("'mimetype' content has surrounding whitespace".into());
             }
         } else if opts.require_mimetype {
             return Err(LibError::Container("missing mimetype entry".into()));
@@ -382,6 +377,48 @@ fn read_entry<R: Read + Seek>(
     let mut buf = Vec::new();
     entry.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Length of a "mimetype" ZIP header, which starts at offset 30.
+const MIMETYPE_HEADER_LEN: usize = 30 + "mimetype".len();
+
+/// The start of the container that should hold the "mimetype" ZIP header.
+/// `None` if the container is shorter than that.
+fn read_first_header<R: Read + Seek>(reader: &mut R) -> Result<Option<[u8; MIMETYPE_HEADER_LEN]>> {
+    let mut header = [0u8; MIMETYPE_HEADER_LEN];
+    reader.rewind()?;
+    match reader.read_exact(&mut header) {
+        Ok(()) => Ok(Some(header)),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Check the mimetype's layout against EN 319 162-1 v1.1.1, A.1:
+/// - "mimetype" shall be the first file in the ASiC container
+/// - "mimetype" shall not contain "Extra fields" in its ZIP header
+/// - "mimetype" shall not be compressed
+/// - the first 4 octets of the ASiC container file shall have the hex values "50 4B 03 04"
+fn check_mimetype_header(header: Option<[u8; MIMETYPE_HEADER_LEN]>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    match header {
+        Some(h) if h[..4] != [0x50, 0x4B, 0x03, 0x04] => {
+            warnings.push("the first 4 octets of the container are not \"50 4B 03 04\"".into());
+        }
+        // The file name length at offset 26 is that of "mimetype".
+        Some(h) if h[26..28] == [8, 0] && h[30..] == *b"mimetype" => {
+            // The compression method in its ZIP header at offset 8 shall be set to zero.
+            if h[8..10] != [0, 0] {
+                warnings.push("'mimetype' is compressed".into());
+            }
+            // The extra field length at offset 28 shall be set to zero.
+            if h[28..30] != [0, 0] {
+                warnings.push("'mimetype' has \"Extra fields\" in its ZIP header".into());
+            }
+        }
+        _ => warnings.push("'mimetype' is not the first file in the container".into()),
+    }
+    warnings
 }
 
 fn validate_entry_name(name: &str) -> Result<()> {

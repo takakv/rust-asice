@@ -220,3 +220,70 @@ fn enforces_size_limit() {
     let expected = format!("more than the {} byte limit", total - 1);
     assert!(err.to_string().contains(&expected), "{err}");
 }
+
+#[test]
+fn warns_on_mimetype_layout() {
+    use std::io::Write;
+    use zip::write::FullFileOptions;
+
+    let stored = FullFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let build = |mimetype_opts: FullFileOptions<'static, 'static>, mimetype: &[u8]| {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("mimetype", mimetype_opts).unwrap();
+        zip.write_all(mimetype).unwrap();
+        for (name, content) in [
+            ("test.txt", b"lorem ipsum".as_slice()),
+            ("META-INF/manifest.xml", EXTRAS_MANIFEST.as_bytes()),
+        ] {
+            zip.start_file(name, stored.clone()).unwrap();
+            zip.write_all(content).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    };
+    let warnings = |bytes: &[u8]| Container::from_bytes(bytes).unwrap().warnings().to_vec();
+    let mimetype = asic_e::MIMETYPE.as_bytes();
+
+    assert!(warnings(&build(stored.clone(), mimetype)).is_empty());
+
+    let mut extra = stored.clone();
+    extra.add_extra_field(0x4141, b"xy", false).unwrap();
+    assert_eq!(
+        warnings(&build(extra, mimetype)),
+        ["'mimetype' has \"Extra fields\" in its ZIP header"]
+    );
+
+    let deflated = stored
+        .clone()
+        .compression_method(zip::CompressionMethod::Deflated);
+    assert_eq!(
+        warnings(&build(deflated, mimetype)),
+        ["'mimetype' is compressed"]
+    );
+
+    let newline = format!("{}\n", asic_e::MIMETYPE);
+    assert_eq!(
+        warnings(&build(stored.clone(), newline.as_bytes())),
+        ["'mimetype' content has surrounding whitespace"]
+    );
+
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, content) in [
+        ("test.txt", b"lorem ipsum".as_slice()),
+        ("mimetype", mimetype),
+        ("META-INF/manifest.xml", EXTRAS_MANIFEST.as_bytes()),
+    ] {
+        zip.start_file(name, stored.clone()).unwrap();
+        zip.write_all(content).unwrap();
+    }
+    assert_eq!(
+        warnings(&zip.finish().unwrap().into_inner()),
+        ["'mimetype' is not the first file in the container"]
+    );
+
+    let mut prepended = b"junk".to_vec();
+    prepended.extend(build(stored.clone(), mimetype));
+    assert_eq!(
+        warnings(&prepended),
+        ["the first 4 octets of the container are not \"50 4B 03 04\""]
+    );
+}
